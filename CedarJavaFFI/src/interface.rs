@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-use cedar_policy::entities_errors::EntitiesError;
+use cedar_policy::{entities_errors::EntitiesError, EntityTypeName};
 #[cfg(feature = "partial-eval")]
 use cedar_policy::ffi::is_authorized_partial_json_str;
 use cedar_policy::{
@@ -23,14 +23,14 @@ use cedar_policy::{
 };
 use cedar_policy_formatter::{policies_str_to_pretty, Config};
 use jni::{
-    objects::{JClass, JObject, JString, JValueGen, JValueOwned},
+    objects::{JClass, JObject, JString, JValue, JValueGen, JValueOwned},
     sys::{jstring, jvalue},
     JNIEnv,
 };
 use jni_fn::jni_fn;
 use serde::{Deserialize, Serialize};
 use serde_json::{from_str, Value};
-use std::{error::Error, str::FromStr, thread};
+use std::{any::Any, collections::HashMap, error::Error, str::FromStr, thread};
 
 use crate::objects::JFormatterConfig;
 use crate::{
@@ -274,6 +274,16 @@ pub fn parsePoliciesJni<'a>(mut env: JNIEnv<'a>, _: JClass, policies_jstr: JStri
     }
 }
 
+pub fn parse_policy_set_to_text_map(input: &str,) -> Result<(Vec<(String, String)>, Vec<(String, String)>)> 
+{
+    let policy_set = PolicySet::from_str(input)?;
+    let policies = policy_set.policies().map(|p| (p.id().to_string(), p.to_string())).collect();
+
+    let templates = policy_set.templates().map(|t| (t.id().to_string(), t.to_string())).collect();
+    // first string is ID second is Policy - same with templates
+    Ok((policies, templates))
+}
+
 fn parse_policies_internal<'a>(
     env: &mut JNIEnv<'a>,
     policies_jstr: JString<'a>,
@@ -281,61 +291,50 @@ fn parse_policies_internal<'a>(
     if policies_jstr.is_null() {
         raise_npe(env)
     } else {
-        // Parse the string into the Rust PolicySet
         let policies_jstring = env.get_string(&policies_jstr)?;
         let policies_string = String::from(policies_jstring);
-        let policy_set = PolicySet::from_str(&policies_string)?;
+       
+        match parse_policy_set_to_text_map(&policies_string)
+        {
+            Ok((policies,templates)) => 
+            {
+                let policies_set = build_java_policy_set(env, policies)?;
+                let template_set = build_java_policy_set(env, templates)?;
 
-        // Enumerate over the parsed policies
-        let mut policies_java_hash_set = Set::new(env)?;
-        for policy in policy_set.policies() {
-            let policy_id = format!("{}", policy.id());
-            let policy_text = format!("{}", policy);
-            let java_policy_object = JPolicy::new(
-                env,
-                &env.new_string(&policy_text)?,
-                &env.new_string(&policy_id)?,
-            )?;
-            let _ = policies_java_hash_set.add(env, java_policy_object);
+                let policy_set_obj = create_java_policy_set(env, policies_set.as_ref(), template_set.as_ref())?; //unknown 
+                Ok(JValueGen::Object(policy_set_obj))
+            }
+    
+            Err(e) => Err(e)
         }
-
-        let mut templates_java_hash_set = Set::new(env)?;
-        for template in policy_set.templates() {
-            let policy_id = format!("{}", template.id());
-            let policy_text = format!("{}", template);
-            let java_policy_object = JPolicy::new(
-                env,
-                &env.new_string(&policy_text)?,
-                &env.new_string(&policy_id)?,
-            )?;
-            let _ = templates_java_hash_set.add(env, java_policy_object);
-        }
-
-        let java_policy_set = create_java_policy_set(
-            env,
-            policies_java_hash_set.as_ref(),
-            templates_java_hash_set.as_ref(),
-        );
-
-        Ok(JValueGen::Object(java_policy_set))
     }
 }
-
+    fn build_java_policy_set<'a>(env: &mut JNIEnv<'a>,entries: Vec<(String, String)>,)-> Result<Set<'a, JPolicy<'a>>>  {
+    let mut set = Set::new(env)?;
+    for (id, text) in entries {
+        let j_id = env.new_string(id)?;
+        let j_text = env.new_string(text)?;
+        let policy_obj = JPolicy::new(env, &j_text, &j_id)?; 
+        set.add(env, policy_obj)?; 
+    }
+    Ok(set)
+}
 fn create_java_policy_set<'a>(
     env: &mut JNIEnv<'a>,
-    policies_java_hash_set: &JObject<'a>,
-    templates_java_hash_set: &JObject<'a>,
-) -> JObject<'a> {
-    env.new_object(
+    policies_java_hash_set: &JObject<'a>, 
+    templates_java_hash_set: &JObject<'a>, 
+) -> Result<JObject<'a>> { 
+    let policy_set_obj = env.new_object( 
         "com/cedarpolicy/model/policy/PolicySet",
-        "(Ljava/util/Set;Ljava/util/Set;)V",
+        "(Ljava/util/Set;Ljava/util/Set;)V", 
         &[
-            JValueGen::Object(policies_java_hash_set),
+            JValueGen::Object(policies_java_hash_set), 
             JValueGen::Object(templates_java_hash_set),
         ],
-    )
-    .expect("Failed to create new PolicySet object")
-}
+    )?; 
+    
+    Ok(policy_set_obj) }
+
 
 #[jni_fn("com.cedarpolicy.model.policy.Policy")]
 pub fn getPolicyAnnotationsJni<'a>(
@@ -549,18 +548,26 @@ pub fn getEntityIdentifierRepr<'a>(mut env: JNIEnv<'a>, _: JClass, obj: JObject<
     }
 }
 
+pub fn get_entity_identifier_str<'a>(entity_id: &JEntityId<'a>) -> String
+{
+    entity_id.get_string_repr()
+}
+
 fn get_entity_identifier_repr_internal<'a>(
     env: &mut JNIEnv<'a>,
     obj: JObject<'a>,
 ) -> Result<JValueOwned<'a>> {
     if obj.is_null() {
-        raise_npe(env)
-    } else {
-        let eid = JEntityId::cast(env, obj)?;
-        let repr = eid.get_string_repr();
-        let jstring = env.new_string(repr)?.into();
-        Ok(JValueGen::Object(jstring))
+        return raise_npe(env);
     }
+    //cast wrapper
+    let eid = JEntityId::cast(env, obj)?;
+
+    //Error handling
+    let repr = get_entity_identifier_str(&eid);
+    let jstring = env.new_string(&repr)?;
+    Ok(JValueGen::Object(jstring.into()))
+
 }
 
 #[jni_fn("com.cedarpolicy.value.EntityTypeName")]
@@ -571,6 +578,10 @@ pub fn parseEntityTypeName<'a>(mut env: JNIEnv<'a>, _: JClass, obj: JString<'a>)
     }
 }
 
+fn parse_entity_type_name_str(input: &str) -> Result<EntityTypeName>
+{
+    EntityTypeName::from_str(input).map_err(|e| Box::new(e) as _)
+}
 pub fn parse_entity_type_name_internal<'a>(
     env: &mut JNIEnv<'a>,
     obj: JString<'a>,
@@ -578,9 +589,10 @@ pub fn parse_entity_type_name_internal<'a>(
     if obj.is_null() {
         raise_npe(env)
     } else {
-        let jstring = env.get_string(&obj)?;
-        let src = String::from(jstring);
-        JEntityTypeName::parse(env, &src).map(Into::into)
+        let input_str: String = env.get_string(&obj)?.into();
+        let entity_type = parse_entity_type_name_str(&input_str)?;
+        let j_entity_type_name =JEntityTypeName::try_from(env, &entity_type)?;
+        Ok(j_entity_type_name.into())
     }
 }
 
@@ -614,18 +626,39 @@ pub fn parseEntityUID<'a>(mut env: JNIEnv<'a>, _: JClass, obj: JString<'a>) -> j
     r
 }
 
+pub fn parse_entity_uid_internal_str(euid_str: &str) -> std::result::Result<HashMap<String, String>, Box<dyn std::error::Error>> {
+    let cedar_euid = EntityUid::from_str(euid_str)?;
+    let mut result = HashMap::new();
+    result.insert("id".to_string(), format!("{:?}", cedar_euid.type_id()));
+
+    result.insert("type".to_string(), cedar_euid.type_name().to_string());
+    Ok(result)
+}
+
 fn parse_entity_uid_internal<'a>(
     env: &mut JNIEnv<'a>,
     obj: JString<'a>,
 ) -> Result<JValueOwned<'a>> {
     if obj.is_null() {
-        raise_npe(env)
-    } else {
-        let jstring = env.get_string(&obj)?;
-        let src = String::from(jstring);
-        let obj = JEntityUID::parse(env, &src)?;
-        Ok(obj.into())
+        return raise_npe(env); 
     }
+
+    let jstring_wrapper = env.get_string(&obj)?; 
+    let src = jstring_wrapper.to_str()?; 
+    let parsed_result_map = parse_entity_uid_internal_str(src)?; 
+    let map_obj = env.new_object("java/util/HashMap", "()V", &[])?;
+        for (key, value) in parsed_result_map {
+        let j_key_string = env.new_string(key)?;
+        let j_value_string = env.new_string(value)?;
+        env.call_method(
+            &map_obj, 
+            "put",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;", 
+            &[JValueGen::Object(&j_key_string), JValueGen::Object(&j_value_string)], 
+        )?;
+    }
+    
+    Ok(JValueOwned::Object(map_obj)) 
 }
 
 #[jni_fn("com.cedarpolicy.value.EntityUID")]
@@ -683,6 +716,11 @@ pub fn policiesStrToPrettyWithConfig<'a>(
     }
 }
 
+fn format_policies_str_with_config(input: &str, config: &Config) -> std::result::Result<String, Box<dyn std::error::Error>> {
+    policies_str_to_pretty(input, config)
+        .map_err(|e| Box::<dyn std::error::Error>::from(e.to_string()))
+}
+
 fn policies_str_to_pretty_internal<'a>(
     env: &mut JNIEnv<'a>,
     policies_jstr: JString<'a>,
@@ -691,19 +729,19 @@ fn policies_str_to_pretty_internal<'a>(
     if policies_jstr.is_null() || config_obj.as_ref().is_some_and(|obj| obj.is_null()) {
         raise_npe(env)
     } else {
-        let config = if let Some(obj) = config_obj {
+        let config = if let Some(obj) = config_obj
+        {
             JFormatterConfig::cast(env, obj)?.get_rust_repr()
-        } else {
+        }
+        else
+        {
             Config::default()
         };
         let policies_str = String::from(env.get_string(&policies_jstr)?);
-        match policies_str_to_pretty(&policies_str, &config) {
-            Ok(formatted_policies) => Ok(env.new_string(formatted_policies)?.into()),
-            Err(e) => Err(e.into()),
-        }
+        let formatted_string = format_policies_str_with_config(&policies_str, &config)?;
+        Ok(env.new_string(formatted_string)?.into())
     }
 }
-
 #[cfg(test)]
 mod jvm_based_tests {
     use super::*;
@@ -807,35 +845,40 @@ mod jvm_based_tests {
             );
         }
         #[test]
-        fn test_parse_policy_internal_valid() {
+        fn parse_policy_internal_valid() {
             let mut env = JVM.attach_current_thread().unwrap();
             let input = r#"permit(principal,action,resource);"#;
             let policy_jstr = env.new_string(input).unwrap();
+            
             let result = parse_policy_internal(&mut env, policy_jstr);
-            assert!(result.is_ok(), "Expected parse_policy_internal succeeded");
+            assert!(result.is_ok(), "Expected parse_policy_internal to succeed: {:?}", result);
 
             let jvalue = result.unwrap();
             let parsed_jstring = JString::cast(&mut env, jvalue.l().unwrap()).unwrap();
-            let parsed_string = String::from(env.get_string(&parsed_jstring).unwrap());
-
-            assert!(parsed_string.contains("permit"));
-            assert!(parsed_string.contains("principal"))
+            let actual_parsed_string = String::from(env.get_string(&parsed_jstring).unwrap());
+            let expected_policy_object = cedar_policy::Policy::from_str(input).unwrap();
+            let expected_canonical_string = format!("{}", expected_policy_object);
+            assert_eq!(
+                actual_parsed_string,
+                expected_canonical_string,
+                "Parsed policy string should match the expected canonical format."
+            );
         }
-
-        #[test]
-        fn parse_policy_internal_invalid() {
+         #[test]
+        fn parse_policy_internal_invalid_missing_template_slots() {
             let mut env = JVM.attach_current_thread().unwrap();
-            let input_invalid = r#"permit(Principal Action Resource);"#;
-            let jstr = env.new_string(input_invalid).unwrap();
-            let result = parse_policy_internal(&mut env, jstr);
-            if let Err(e) = &result {
-                println!("expected parsing failed")
-            }
-            assert!(result.is_err());
-        }
+            let input = r#"permit(principal == User::"alice", action == Action::"read", resource == Resource::"file");"#;
+            let jstr = env.new_string(input).unwrap();
 
+            let result = parse_policy_template_internal(&mut env, jstr);
+
+            assert!(
+                result.is_err(),
+                "Expected parse_policy_template_internal to fail due to missing template slots"
+            );
+        }
         #[test]
-        fn test_parse_policies_internal_invalid() {
+        fn parse_policies_internal_invalid(){
             let mut env = JVM.attach_current_thread().unwrap();
 
             let invalid_input = "not a valid input";
@@ -859,77 +902,65 @@ mod jvm_based_tests {
             let invalid_input = r#"permit(Principa,Action,Resource );"#;
             let jstr = env.new_string(invalid_input).unwrap();
             let result = parse_policy_template_internal(&mut env, jstr);
+            assert!(result.is_err(),"Expected to fail for invalid input");
+         }
+         #[test]
+fn from_json_test_valid() {
+    let mut env = JVM.attach_current_thread().unwrap();
 
-            if let Err(_e) = &result {
-                println!("expected failure{}", _e);
-            }
-
-            assert!(result.is_err())
-        }
-
-        #[test]
-        fn from_json_test_valid() {
-            let mut env = JVM.attach_current_thread().unwrap();
-
-            let policy_json = r#"
-        {
-            "effect": "permit",
-            "principal": {
-                "op": "==",
-                "entity": { "type": "User", "id": "12UA45" }
-            },
-            "action": {
-                "op": "==",
-                "entity": { "type": "Action", "id": "view" }
-            },
-            "resource": {
-                "op": "in",
-                "entity": { "type": "Folder", "id": "abc" }
-            },
-            "conditions": [
-                {
-                    "kind": "when",
-                    "body": {
-                        "==": {
-                            "left": {
-                                ".": {
-                                    "left": {
-                                        "Var": "context"
-                                    },
-                                    "attr": "tls_version"
-                                }
-                            },
-                            "right": {
-                                "Value": "1.3"
+    let policy_json = r#"
+    {
+        "effect": "permit",
+        "principal": {
+            "op": "==",
+            "entity": { "type": "User", "id": "12UA45" }
+        },
+        "action": {
+            "op": "==",
+            "entity": { "type": "Action", "id": "view" }
+        },
+        "resource": {
+            "op": "in",
+            "entity": { "type": "Folder", "id": "abc" }
+        },
+        "conditions": [
+            {
+                "kind": "when",
+                "body": {
+                    "==": {
+                        "left": {
+                            ".": {
+                                "left": { "Var": "context" },
+                                "attr": "tls_version"
                             }
-                        }
+                        },
+                        "right": { "Value": "1.3" }
                     }
                 }
-            ]
-        }
-            "#;
+            }
+        ]
+    }
+    "#;
 
-            let jstr = env.new_string(policy_json).unwrap();
-            let result = from_json_internal(&mut env, jstr);
+    let jstr = env.new_string(policy_json).unwrap();
+    let result = from_json_internal(&mut env, jstr);
+    assert!(result.is_ok(), "Expected from_json parsing to succeed, got: {:?}", result);
 
-            assert!(result.is_ok(), "Parsing failed: {:?}", result);
+    let jval = result.unwrap();
+    let obj = jval.l().unwrap();
+    let str_val: String = env.get_string(&obj.into()).unwrap().into();
+    assert!(
+        str_val.to_lowercase().contains("permit"),
+        "Expected 'permit' in the policy string, got: '{}'",
+        str_val
+    );
+}
 
-            let jval = result.unwrap();
-            let obj = jval.l().unwrap();
-            let str_val: String = env.get_string(&obj.into()).unwrap().into();
-
-            println!("Returned policy string: '{}'", str_val);
-
-            assert!(
-                str_val.to_lowercase().contains("permit"),
-                "Expected 'permit' in the policy string, got: '{}'",
-                str_val
-            );
-        }
-        #[test]
-        fn from_json_invalid() {
-            let mut env = JVM.attach_current_thread().unwrap();
-            let invalid_input = r#"
+ #[test]
+    fn from_json_invalid()
+    {
+        let mut env = JVM.attach_current_thread().unwrap();
+        let invalid_input = r#"
         {
             "Effect": "permit",
             "Principal": {
@@ -967,10 +998,13 @@ mod jvm_based_tests {
         }
         "#;
 
-            let jstr = env.new_string(invalid_input).unwrap();
-            let result = from_json_internal(&mut env, jstr);
-            assert!(result.is_err(), "Not valid jason ");
-        }
+        let jstr = env.new_string(invalid_input).unwrap();
+        let result = from_json_internal(&mut env, jstr);
+        assert!(result.is_err(), "Expected json parsing to fail: {:?}", result);    
+    
+    }
+
+   
 
         #[test]
         fn to_json_internal_test() {
@@ -988,9 +1022,9 @@ mod jvm_based_tests {
             let invalid_input = r#"Permit(Principal, Resource, Action);"#;
             let jstr = env.new_string(invalid_input).unwrap();
 
-            let result = from_json_internal(&mut env, jstr);
-            assert!(result.is_err(), "invalid input");
-        }
+        let result = from_json_internal(&mut env, jstr);
+        assert!(result.is_err(), "Expected json_internal parsing to fail: {:?}", result);    }
+        
     }
     mod map_tests {
         use super::*;
@@ -1058,15 +1092,62 @@ mod jvm_based_tests {
                 "Retrieved value should be equal to the inserted value."
             )
         }
+        #[test]
+        fn test_parse_cedar_schema_internal_invalid() {
+            let mut env = JVM.attach_current_thread().unwrap();
+
+            let invalid_input = "Not a valid input";
+            let schema_jstr = env.new_string(invalid_input).unwrap();
+            let result = parse_cedar_schema_internal(&mut env, schema_jstr);
+            assert!(
+                result.is_err(),
+                "Expected parse_cedar_schema_internal to fail"
+            );
+        }
+        #[test]
+        fn parse_cedar_schema_internal_valid() {
+            let mut env = JVM.attach_current_thread().unwrap();
+
+            let input = r#"
+        entity User = {
+            name: String,
+            age?: Long,
+        };
+        entity Photo in Album;
+        entity Album;
+        action view appliesTo {
+            principal : [User],
+            resource: [Album,Photo]
+        }; 
+    "#;
+
+            let schema_jstr = env.new_string(input).unwrap();
+            let result = parse_cedar_schema_internal(&mut env, schema_jstr);
+
+            assert!(
+                result.is_ok(),
+                "Expected parse_cedar_schema_internal to succeed"
+            );
+
+            let jvalue = result.unwrap();
+            let parsed_jstring = JString::cast(&mut env, jvalue.l().unwrap()).unwrap();
+            let parsed_string = String::from(env.get_string(&parsed_jstring).unwrap());
+            assert_eq!(parsed_string, "success");
+        }
+
+       
     }
-    mod schema_test {
+    mod schema_test{
+        use std::result;
+
+        use cedar_policy::{EntityId, Schema};
         use super::*;
-        use cedar_policy::Schema;
 
-        #[test]
-        fn test_parse_json_str_valid() {
-            let json = r#"
-        {
+     #[test]
+     fn parse_json_schema_internal_valid_test()
+     {
+        let mut env = JVM.attach_current_thread().unwrap();
+        let input = r#" {
         "schema": {
             "entityTypes": {
             "User": {
@@ -1085,54 +1166,23 @@ mod jvm_based_tests {
             }
         }
         }"#;
+        let jstr = env.new_string(input).unwrap();
+        let result = parse_json_schema_internal(&mut env, jstr);
+        assert!(result.is_ok(), "successfully parsed json_schema_internal");
 
-            let result = Schema::from_json_str(json);
-            assert!(result.is_ok(), "Expected schema parsing to succeed");
-        }
+        let output = result.unwrap();
+        let jstring_obj = output.l().unwrap();
+        let jstring : jni::objects::JString = JString:: from(jstring_obj);
+        let rust_output: String = env.get_string(&jstring).unwrap().into();
+        assert_eq!(rust_output,"success");
 
-        #[test]
-        fn test_parse_json_str_invalid() {
-            let invalid_json = "this is not valid JSON";
-            let result = Schema::from_json_str(invalid_json);
-            assert!(result.is_err(), "Expected schema parsing to fail");
-        }
-        #[test]
-        fn parse_json_schema_internal_valid_test() {
-            let mut env = JVM.attach_current_thread().unwrap();
-            let input = r#" {
-        "schema": {
-            "entityTypes": {
-            "User": {
-                "memberOfTypes": ["Group"]
-            },
-            "Group": {},
-            "File": {}
-            },
-            "actions": {
-            "read": {
-                "appliesTo": {
-                "principalTypes": ["User"],
-                "resourceTypes": ["File"]
-                }
-            }
-            }
-        }
-        }"#;
-            let jstr = env.new_string(input).unwrap();
-            let result = parse_json_schema_internal(&mut env, jstr);
-            assert!(result.is_ok(), "successfully parsed schema");
-
-            let output = result.unwrap();
-            let jstring_obj = output.l().unwrap();
-            let jstring: jni::objects::JString = JString::from(jstring_obj);
-            let rust_output: String = env.get_string(&jstring).unwrap().into();
-            assert_eq!(rust_output, "success");
-        }
-
-        #[test]
-        fn parse_json_schema_internal_invalid_test() {
-            let mut env = JVM.attach_current_thread().unwrap();
-            let invalid_input = r#" {
+     }
+    
+     #[test]
+     fn parse_json_schema_internal_invalid_test()
+     {
+        let mut env = JVM.attach_current_thread().unwrap();
+        let invalid_input = r#" {
         "Schema": {
             "entityTypes": {
             "User": {
@@ -1152,103 +1202,90 @@ mod jvm_based_tests {
         }
         }"#;
 
-            let jstr = env.new_string(invalid_input).unwrap();
-            let result = parse_json_schema_internal(&mut env, jstr);
-            assert!(result.is_err(), " Expected parsing has failed");
+        let jstr = env.new_string(invalid_input).unwrap();
+        let result = parse_json_schema_internal(&mut env, jstr);
+        assert!(result.is_err(), "Expected json_schema_internal parsing to fail: {:?}", result);     
+    }
+   
+         #[test]
+        fn test_parse_policies_set_text_map()
+        {
+            let input_policies = r#"permit(principal, action , resource);
+            permit(principal,action,resource) when {principal has x && principal.x == 5};"#;
+
+            let result = parse_policy_set_to_text_map(input_policies);
+
+            assert!(result.is_ok())
+        }
+
+        #[test]
+        fn test_parse_policies_set_map_invalid()
+        {
+            let invalid_policies =r#"permit(principal?, action? , resource);
+            permit(principal,action,resource) if {principal has x && principal.x == 5};"#;
+
+            let result = parse_policy_set_to_text_map(invalid_policies);
+            assert!(result.is_err(),"Expected policy set to fail")
         }
         #[test]
-        fn test_parse_cedar_schema_internal_invalid() {
-            let mut env = JVM.attach_current_thread().unwrap();
+        fn parse_policies_empty()
+        {
+            let input = "";
+            let result = parse_policy_set_to_text_map(input).unwrap();
 
-            let invalid_input = "Not a valid input";
-            let schema_jstr = env.new_string(invalid_input).unwrap();
-            let result = parse_cedar_schema_internal(&mut env, schema_jstr);
-            assert!(
-                result.is_err(),
-                "Expected parse_cedar_schema_internal to fail"
-            );
+            let(policies,templates) = result;
+            assert!(policies.is_empty());
+            assert!(templates.is_empty())
         }
         #[test]
-        fn test_parse_cedar_schema_internal_valid() {
-            let mut env = JVM.attach_current_thread().unwrap();
+        fn parse_policy_set_to_text_map_static_policies()
+        {
+            let input =r#"
+            permit(principal,action,resource);
+            forbid(principal == User::"bob",action,resource);"#;
+            let result = parse_policy_set_to_text_map(input).unwrap();
 
-            let input = r#"
-        entity User = {
-            name: String,
-            age?: Long,
-        };
+            let(policies,templates )= result;
+            assert_eq!(policies.len(),2);
 
-        entity Photo in Album;
-        entity Album;
+            let p1_found = policies.iter().any(|(id,src)| src.contains("permit")&& id.starts_with("policy"));
+            let p2_found = policies.iter().any(|(id,src)| src.contains("forbid")&& src.contains("User::\"bob\"") && id.starts_with("policy"));
 
-        action view appliesTo {
-            principal : [User],
-            resource: [Album,Photo]
-        }; 
+            assert!(p1_found);
+            assert!(p2_found);
+
+            assert!(templates.is_empty());
+        }
+          #[test]
+fn  parse_policy_set_to_text_map_templates() {
+    let input = r#"
+        permit(principal,action,resource);
     "#;
 
-            let schema_jstr = env.new_string(input).unwrap();
-            let result = parse_cedar_schema_internal(&mut env, schema_jstr);
+    let result = parse_policy_set_to_text_map(input).unwrap();
+    let (policies, templates) = result;
 
-            assert!(
-                result.is_ok(),
-                "Expected parse_cedar_schema_internal to succeed"
-            );
+    assert_eq!(policies.len(), 1, "Expected 1 static policy.");
+    assert!(templates.is_empty(), "Expected no templates.");
 
-            let jvalue = result.unwrap();
-            let parsed_jstring = JString::cast(&mut env, jvalue.l().unwrap()).unwrap();
-            let parsed_string = String::from(env.get_string(&parsed_jstring).unwrap());
+    let p1_found = policies.iter().any(|(_id, src)| src.contains("permit"));
+    assert!(p1_found, "permit policy not found or content is incorrect.");
+}
+       
 
-            println!("Parsed schema output: {}", parsed_string);
-            assert_eq!(parsed_string, "success");
+    
+    #[test]
+        fn get_entity_identifier_repr_internal_null_input() {
+            let mut env = JVM.attach_current_thread().unwrap();
+            let result = get_entity_identifier_repr_internal(&mut env, JObject::null());
+            assert!(env.exception_check().unwrap());
+            assert!(result.is_ok(),"Succeded passing get_entity_identifier_repr_internal_null");
         }
-        #[test]
-        fn test_parse_policy_set_valid() {
-            let input = r#"
-            permit(principal, action , resource);
-            permit(principal,action,resource) when {principal has x && principal.x == 5};
-        "#;
-
-            let result = PolicySet::from_str(input);
-            assert!(result.is_ok(), "Expected parsing to succeed");
-
-            let policy_set = result.unwrap();
-
-            assert_eq!(policy_set.policies().count(), 2);
-            assert_eq!(policy_set.templates().count(), 0);
-        }
-
-        #[test]
-        fn test_parse_policy_set_invalid() {
-            let input = r#"
-            permit();
-        "#;
-
-            let result = PolicySet::from_str(input);
-            assert!(
-                result.is_err(),
-                "Expected parsing to fail on invalid policy"
-            );
-        }
-
-        #[test]
-        fn test_parse_policy_set_with_template() {
-            let input = r#"
-            permit(principal == ?principal, action, resource == ?resource);
-        "#;
-
-            let result = PolicySet::from_str(input);
-            assert!(
-                result.is_ok(),
-                "Expected template policy parsing to succeed"
-            );
-
-            let policy_set = result.unwrap();
-            assert_eq!(policy_set.policies().count(), 0);
-            assert_eq!(policy_set.templates().count(), 1);
-        }
-        #[test]
-        fn template_effect_jni_internal_permit_test() {
+       
+        
+ 
+    #[test]
+        fn template_effect_jni_internal_permit_test(){
             let mut env = JVM.attach_current_thread().unwrap();
             let template_policy = r#"permit(principal==?principal,action == Action::"readfile",resource==?resource );"#;
 
@@ -1269,10 +1306,6 @@ mod jvm_based_tests {
             let jstr = env.new_string(cedar_policy).unwrap();
 
             let result = template_effect_jni_internal(&mut env, jstr);
-            if let Err(_e) = &result {
-                println!("failed to parse template");
-            }
-
             assert!(result.is_ok());
 
             let jvalue = result.unwrap();
@@ -1281,5 +1314,229 @@ mod jvm_based_tests {
 
             assert_eq!(effect, "forbid");
         }
+
+    #[test]
+    fn parse_entity_uid_valid()
+    {
+        let mut env = JVM.attach_current_thread().unwrap();
+
+        let input = r#"Foo::Bar::"alice""#;
+
+        let jstr = env.new_string(input).unwrap();
+        let result = parse_entity_uid_internal(&mut env, jstr);
+
+        assert!(result.is_ok(),"Expected Entity_uid was successful");
+    }
+    #[test]
+    fn parse_entity_uid_internal_invalid_test()
+
+    {
+
+        let mut env = JVM.attach_current_thread().unwrap();
+
+        let invalid_input = r#"foo==\Alice\""#;
+
+
+        let jstr = env.new_string(invalid_input).unwrap();
+
+        let result = parse_entity_uid_internal(&mut env, jstr);
+
+        assert!(result.is_err(),"Expected to parse_entity_uid_internal");
+
+    }
+     #[test]
+        fn  parse_entity_uid_internal_invalid_syntax() {
+            let mut env = JVM.attach_current_thread().unwrap();
+            let input = "Invalid::\"uid"; 
+            let jstr = env.new_string(input).unwrap();
+
+            let result = parse_entity_uid_internal(&mut env, jstr);
+            
+            assert!(result.is_err(), "Expected an error for invalid EUID syntax.");
+        }
+
+    }
+      
+        
+
+    
+
+#[cfg(test)]
+mod helper_tests {
+    use std::result;
+
+    use super::*;
+    use cedar_policy::EntityId; 
+
+    fn get_entity_identifier_string_representation(entity_id: &cedar_policy::EntityId) -> String {
+        entity_id.escaped().to_string()
+    }
+
+    #[test]
+    fn  get_entity_identifier_string_representation_simple() {
+        let entity_id = EntityId::new("alice".to_string());
+       
+        let expected_repr = "alice".to_string();
+        let actual_repr = get_entity_identifier_string_representation(&entity_id);
+        assert_eq!(actual_repr, expected_repr);
+    }
+
+    #[test]
+    fn  get_entity_identifier_string_representation_with_special_chars() {
+        let entity_id = EntityId::new("al\\ice".to_string()); 
+       
+        let expected_repr = "al\\\\ice".to_string();
+        let actual_repr = get_entity_identifier_string_representation(&entity_id);
+        assert_eq!(actual_repr, expected_repr);
+    }
+
+    #[test]
+    fn  get_entity_identifier_string_representation_empty() {
+        let entity_id = EntityId::new("".to_string());
+        
+        let expected_repr = "".to_string();
+        let actual_repr = get_entity_identifier_string_representation(&entity_id);
+        assert_eq!(actual_repr, expected_repr);
+    }
+
+    #[test]
+    fn  get_entity_identifier_string_representation_long_string() {
+        let long_id = "a".repeat(1000); 
+        let entity_id = EntityId::new(long_id.clone());
+        
+        let expected_repr = format!("{}", long_id);
+        let actual_repr = get_entity_identifier_string_representation(&entity_id);
+        assert_eq!(actual_repr, expected_repr);
+    }
+
+    #[test]
+    fn parse_entity_type_name_internal_test()
+    {
+        let input = "User";
+        let result = parse_entity_type_name_str(input).unwrap();
+        assert_eq!(result.basename(),"User");
+        assert!(result.namespace_components().next().is_none());
+        assert_eq!(result.to_string(),"User")
+
+    }
+
+    #[test]
+    fn parse_entity_type_name_valid_namespacestr()
+    {
+        let input = "PhotoApp::UserGroup::Admin";
+        let result = parse_entity_type_name_str(input).unwrap();
+        assert_eq!(result.basename(),"Admin");
+        let namespace: Vec<&str> = result.namespace_components().collect();
+        assert_eq!(namespace,vec!["PhotoApp","UserGroup"]);
+        assert_eq!(result.to_string(),"PhotoApp::UserGroup::Admin");
+    }
+    #[test]
+    fn parse_entity_type_name_emptystr()
+    {
+        let input ="";
+        let result = parse_entity_type_name_str(input);
+        assert!(result.is_err(),"Expected parsing failed due to an empty string");
+    }
+    #[test]
+    fn parse_entity_type_name_separatorsstr()
+    {
+        let input = "::";
+        let result = parse_entity_type_name_str(input);
+        assert!(result.is_err(),"Expected parsing failed for only seperators");
+    }
+    #[test]
+    fn  simple_entity_type_valid() {
+        let input = "User";
+        let result = parse_entity_type_name_str(input).unwrap();
+        assert_eq!(result.basename().to_string(), "User");
+        assert!(result.namespace().is_empty(), "Expected no namespace");
+    }
+    #[test]
+    fn  valid_policy_formats_successfully() {
+        let input = r#"
+            permit(principal, action, resource);
+        "#;
+        let config = Config::default();
+
+        let result = format_policies_str_with_config(input, &config);
+        assert!(result.is_ok(), "Expected formatting to succeed");
+
+        let output = result.unwrap();
+        assert!(output.contains("permit"), "Expected output to include 'permit'");
+    }
+    #[test]
+    fn  invalid_policy_returns_error() {
+        let input = r#"
+            permit(principal,, action, resource);
+        "#;
+        let config = Config::default();
+
+        let result = format_policies_str_with_config(input, &config);
+        assert!(result.is_err(), "Expected formatting to fail due to syntax error");
+    }
+     
+         #[test]
+fn  policies_str_to_pretty_internal_valid_policy_string() {
+    let mut env = JVM.attach_current_thread().unwrap();
+    
+   
+    let input = r#"permit(principal, action, resource);"#;
+    let policies_jstr = env.new_string(input).unwrap();
+
+    let result = policies_str_to_pretty_internal(&mut env, policies_jstr, None);
+    assert!(result.is_ok(), "Expected valid policy string to format successfully.");
+
+    let formatted_jvalue = result.unwrap();
+    let jstring_obj: jni::objects::JString = formatted_jvalue.l().unwrap().into();
+    let formatted_str: String = env.get_string(&jstring_obj).unwrap().into();
+
+    assert!(formatted_str.contains("permit"), "Expected output to contain 'permit'.");
+    assert!(formatted_str.contains("(") && formatted_str.contains(")"), "Expected parentheses in formatted output.");
+}
+        #[test]
+        fn  parse_entity_type_name_internal_null_input() {
+            let mut env = JVM.attach_current_thread().unwrap();
+            
+            let result = parse_entity_type_name_internal(&mut env, jni::objects::JString::from(jni::objects::JObject::null()));
+
+            assert!(env.exception_check().unwrap());
+            assert!(result.is_ok());
+        }
+         #[test]
+        fn  parse_entity_type_name_internal_invalid() {
+            let mut env = JVM.attach_current_thread().unwrap();
+            let input_jstr = env.new_string("Invalid::Type!").unwrap(); 
+
+            let result = parse_entity_type_name_internal(&mut env, input_jstr);
+            assert!(result.is_err(), "Expected error for invalid entity type name input");
+        }
+             
+
+    #[test]
+    fn  parse_entity_type_name_str_valid_simple() {
+        let input = "User";
+        let result = parse_entity_type_name_str(input); 
+        assert!(result.is_ok(), "Expected valid parse for 'User' in pure Rust test."); 
+        let parsed_etype = result.unwrap();
+        assert_eq!(parsed_etype.basename(), "User");
+        assert!(parsed_etype.namespace_components().next().is_none());
+    }
+
+    #[test]
+    fn build_java_policy_empty()
+    {
+        let mut env = JVM.attach_current_thread().unwrap();
+        let entries : Vec<(String,String)> = vec![];
+
+        let result = build_java_policy_set(&mut env, entries);
+        assert!(result.is_ok()); 
     }
 }
+}
+
+
+
+
+
+
+    
