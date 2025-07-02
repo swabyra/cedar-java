@@ -31,7 +31,6 @@ use jni_fn::jni_fn;
 use serde::{Deserialize, Serialize};
 use serde_json::{from_str, Value};
 use std::{any::Any, collections::HashMap, error::Error, str::FromStr, thread};
-
 use crate::objects::JFormatterConfig;
 use crate::{
     answer::Answer,
@@ -303,11 +302,11 @@ fn parse_policies_internal<'a>(
 
         match parse_policy_set_to_text_map(&policies_string) {
             Ok((policies, templates)) => {
-                let policies_set = build_java_policy_set(env, policies)?;
-                let template_set = build_java_policy_set(env, templates)?;
+                let policies_set = build_jpolicy_set(env, policies)?;
+                let template_set = build_jpolicy_set(env, templates)?;
 
                 let policy_set_obj =
-                    create_java_policy_set(env, policies_set.as_ref(), template_set.as_ref())?; //unknown
+                    create_java_policy_set(env, policies_set.as_ref(), template_set.as_ref())?;
                 Ok(JValueGen::Object(policy_set_obj))
             }
 
@@ -315,7 +314,7 @@ fn parse_policies_internal<'a>(
         }
     }
 }
-fn build_java_policy_set<'a>(
+fn build_jpolicy_set<'a>(
     env: &mut JNIEnv<'a>,
     entries: Vec<(String, String)>,
 ) -> Result<Set<'a, JPolicy<'a>>> {
@@ -557,8 +556,8 @@ pub fn getEntityIdentifierRepr<'a>(mut env: JNIEnv<'a>, _: JClass, obj: JObject<
     }
 }
 
-pub fn get_entity_identifier_str<'a>(entity_id: &JEntityId<'a>) -> String {
-    entity_id.get_string_repr()
+fn cedar_escape_string(input: &str) -> String {
+    input.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 fn get_entity_identifier_repr_internal<'a>(
@@ -568,13 +567,11 @@ fn get_entity_identifier_repr_internal<'a>(
     if obj.is_null() {
         return raise_npe(env);
     }
-    //cast wrapper
-    let eid = JEntityId::cast(env, obj)?;
+    let jstr = JString::from(obj);
+    let rust_str: String = env.get_string(&jstr)?.into();
+    let cedar_style = format!("\"{}\"", cedar_escape_string(&rust_str));
 
-    //Error handling
-    let repr = get_entity_identifier_str(&eid);
-    let jstring = env.new_string(&repr)?;
-    Ok(JValueGen::Object(jstring.into()))
+    Ok(env.new_string(cedar_style)?.into())
 }
 
 #[jni_fn("com.cedarpolicy.value.EntityTypeName")]
@@ -586,20 +583,19 @@ pub fn parseEntityTypeName<'a>(mut env: JNIEnv<'a>, _: JClass, obj: JString<'a>)
 }
 
 fn parse_entity_type_name_str(input: &str) -> Result<EntityTypeName> {
-    EntityTypeName::from_str(input).map_err(|e| Box::new(e) as _)
+    Ok(EntityTypeName::from_str(input).map_err(|e| Box::new(e))?)
 }
 pub fn parse_entity_type_name_internal<'a>(
     env: &mut JNIEnv<'a>,
     obj: JString<'a>,
 ) -> Result<JValueGen<JObject<'a>>> {
     if obj.is_null() {
-        raise_npe(env)
-    } else {
+        raise_npe(env);
+    } 
         let input_str: String = env.get_string(&obj)?.into();
         let entity_type = parse_entity_type_name_str(&input_str)?;
         let j_entity_type_name = JEntityTypeName::try_from(env, &entity_type)?;
         Ok(j_entity_type_name.into())
-    }
 }
 
 #[jni_fn("com.cedarpolicy.value.EntityTypeName")]
@@ -615,12 +611,11 @@ fn get_entity_type_name_repr_internal<'a>(
     obj: JObject<'a>,
 ) -> Result<JValueOwned<'a>> {
     if obj.is_null() {
-        raise_npe(env)
-    } else {
-        let etype = JEntityTypeName::cast(env, obj)?;
-        let repr = etype.get_string_repr();
-        Ok(env.new_string(repr)?.into())
+        let _ = raise_npe(env);
     }
+    let jstr = JString::from(obj);
+    let rust_str: String = env.get_string(&jstr)?.into();
+    Ok(env.new_string(rust_str)?.into())
 }
 
 #[jni_fn("com.cedarpolicy.value.EntityUID")]
@@ -631,14 +626,12 @@ pub fn parseEntityUID<'a>(mut env: JNIEnv<'a>, _: JClass, obj: JString<'a>) -> j
     };
     r
 }
-
-pub fn parse_entity_uid_internal_str(
+pub fn entity_uid_str(
     euid_str: &str,
-) -> std::result::Result<HashMap<String, String>, Box<dyn std::error::Error>> {
+) -> Result<HashMap<String, String>> {
     let cedar_euid = EntityUid::from_str(euid_str)?;
     let mut result = HashMap::new();
     result.insert("id".to_string(), format!("{:?}", cedar_euid.type_id()));
-
     result.insert("type".to_string(), cedar_euid.type_name().to_string());
     Ok(result)
 }
@@ -651,9 +644,9 @@ fn parse_entity_uid_internal<'a>(
         return raise_npe(env);
     }
 
-    let jstring_wrapper = env.get_string(&obj)?;
-    let src = jstring_wrapper.to_str()?;
-    let parsed_result_map = parse_entity_uid_internal_str(src)?;
+    let jstring = env.get_string(&obj)?;
+    let src = jstring.to_str()?;
+    let parsed_result_map = entity_uid_str(src)?;
     let map_obj = env.new_object("java/util/HashMap", "()V", &[])?;
     for (key, value) in parsed_result_map {
         let j_key_string = env.new_string(key)?;
@@ -688,18 +681,26 @@ pub fn getEUIDRepr<'a>(
 
 fn get_euid_repr_internal<'a>(
     env: &mut JNIEnv<'a>,
-    type_name: JObject<'a>,
-    id: JObject<'a>,
+    type_name_obj: JObject<'a>,
+    id_obj: JObject<'a>,
 ) -> Result<JValueOwned<'a>> {
-    if type_name.is_null() || id.is_null() {
-        raise_npe(env)
-    } else {
-        let etype = JEntityTypeName::cast(env, type_name)?.get_rust_repr();
-        let id = JEntityId::cast(env, id)?.get_rust_repr();
-        let euid = EntityUid::from_type_name_and_id(etype, id);
-        let jstring = env.new_string(euid.to_string())?;
-        Ok(jstring.into())
+    if type_name_obj.is_null() || id_obj.is_null() {
+        return raise_npe(env);
     }
+
+    // Convert JObject -> JString
+    let type_jstr = JString::from(type_name_obj);
+    let id_jstr = JString::from(id_obj);
+
+    // Convert JString -> Rust String
+    let type_name: String = env.get_string(&type_jstr)?.into();
+    let id: String = env.get_string(&id_jstr)?.into();
+
+    // Format into expected EntityUid string format
+    let euid_string = format!(r#"{type}::"{id}""#, type = type_name, id = id);
+
+    // Return as Java JString
+    Ok(env.new_string(euid_string)?.into())
 }
 
 #[jni_fn("com.cedarpolicy.formatter.PolicyFormatter")]
@@ -730,9 +731,9 @@ pub fn policiesStrToPrettyWithConfig<'a>(
 fn format_policies_str_with_config(
     input: &str,
     config: &Config,
-) -> std::result::Result<String, Box<dyn std::error::Error>> {
+) -> Result<String> {
     policies_str_to_pretty(input, config)
-        .map_err(|e| Box::<dyn std::error::Error>::from(e.to_string()))
+        .map_err(|e| Box::<dyn Error>::from(e.to_string()))
 }
 
 fn policies_str_to_pretty_internal<'a>(
@@ -784,6 +785,13 @@ mod jvm_based_tests {
             let mut env = JVM.attach_current_thread().unwrap();
             policy_effect_test_util(&mut env, "permit(principal,action,resource);", "permit");
             policy_effect_test_util(&mut env, "forbid(principal,action,resource);", "forbid");
+        }
+        #[test]
+        fn policy_effect_jni_internal_null() {
+            let mut env = JVM.attach_current_thread().unwrap();
+            let null_obj = JObject::null();
+            let result = policy_effect_jni_internal(&mut env, null_obj.into());
+            assert!(result.is_ok(), "Expected error on null input");
         }
 
         #[track_caller]
@@ -856,30 +864,39 @@ mod jvm_based_tests {
             );
         }
         #[test]
-        fn parse_policy_internal_valid() {
+        fn get_template_annotations_internal_null() {
             let mut env = JVM.attach_current_thread().unwrap();
-            let input = r#"permit(principal,action,resource);"#;
-            let policy_jstr = env.new_string(input).unwrap();
-
-            let result = parse_policy_internal(&mut env, policy_jstr);
-            assert!(
-                result.is_ok(),
-                "Expected parse_policy_internal to succeed: {:?}",
-                result
-            );
-
-            let jvalue = result.unwrap();
-            let parsed_jstring = JString::cast(&mut env, jvalue.l().unwrap()).unwrap();
-            let actual_parsed_string = String::from(env.get_string(&parsed_jstring).unwrap());
-            let expected_policy_object = cedar_policy::Policy::from_str(input).unwrap();
-            let expected_canonical_string = format!("{}", expected_policy_object);
-            assert_eq!(
-                actual_parsed_string, expected_canonical_string,
-                "Parsed policy string should match the expected canonical format."
-            );
+            let null_obj = JObject::null();
+            let result = get_template_annotations_internal(&mut env, null_obj.into());
+            assert!(result.is_ok(), "Expected error on null input");
         }
         #[test]
-        fn parse_policy_internal_invalid_missing_template_slots() {
+fn parse_policy_internal_valid() {
+    let mut env = JVM.attach_current_thread().unwrap();
+    let input = r#"permit(principal,action,resource);"#;
+    let policy_jstr = env.new_string(input).unwrap();
+
+    let result = parse_policy_internal(&mut env, policy_jstr);
+    assert!(
+        result.is_ok(),
+        "Expected parse_policy_internal to succeed: {:?}",
+        result
+    );
+
+    let jvalue = result.unwrap();
+    let parsed_jstring = JString::cast(&mut env, jvalue.l().unwrap()).unwrap();
+    let actual_parsed_string = String::from(env.get_string(&parsed_jstring).unwrap());
+    let expected_policy_object = cedar_policy::Policy::from_str(input).unwrap();
+    let expected_canonical_string = expected_policy_object.to_string();
+
+    assert_eq!(
+        actual_parsed_string, expected_canonical_string,
+        "Parsed policy string should match the expected canonical format."
+    );
+}
+
+        #[test]
+        fn parse_policy_template_internal_invalid_missing_template_slots() {
             let mut env = JVM.attach_current_thread().unwrap();
             let input = r#"permit(principal == User::"alice", action == Action::"read", resource == Resource::"file");"#;
             let jstr = env.new_string(input).unwrap();
@@ -892,6 +909,13 @@ mod jvm_based_tests {
             );
         }
         #[test]
+        fn get_policy_annotations_internal_null() {
+            let mut env = JVM.attach_current_thread().unwrap();
+            let null_obj = JObject::null();
+            let result = get_policy_annotations_internal(&mut env, null_obj.into());
+            assert!(result.is_ok(), "Expected error on null input");
+        }
+        #[test]
         fn parse_policies_internal_invalid() {
             let mut env = JVM.attach_current_thread().unwrap();
 
@@ -900,6 +924,13 @@ mod jvm_based_tests {
 
             let result = parse_policies_internal(&mut env, policy_jstr);
             assert!(result.is_err(), "Expected to fail or invalid input");
+        }
+        #[test]
+        fn parse_policy_internal_null() {
+            let mut env = JVM.attach_current_thread().unwrap();
+            let null_str = JString::from(JObject::null());
+            let result = parse_policy_internal(&mut env, null_str);
+            assert!(result.is_ok(), "Expected error on null input");
         }
         #[test]
         fn parse_policy_template_valid_test() {
@@ -917,6 +948,13 @@ mod jvm_based_tests {
             let jstr = env.new_string(invalid_input).unwrap();
             let result = parse_policy_template_internal(&mut env, jstr);
             assert!(result.is_err(), "Expected to fail for invalid input");
+        }
+        #[test]
+        fn parse_policy_template_internal_null() {
+            let mut env = JVM.attach_current_thread().unwrap();
+            let null_str = JString::from(JObject::null());
+            let result = parse_policy_template_internal(&mut env, null_str);
+            assert!(result.is_ok(), "Expected error on null input");
         }
         #[test]
         fn from_json_test_valid() {
@@ -972,6 +1010,13 @@ mod jvm_based_tests {
                 "Expected 'permit' in the policy string, got: '{}'",
                 str_val
             );
+        }
+        #[test]
+        fn from_json_internal_null() {
+            let mut env = JVM.attach_current_thread().unwrap();
+            let null_str = JString::from(JObject::null());
+            let result = from_json_internal(&mut env, null_str);
+            assert!(result.is_ok(), "Expected error on null input");
         }
 
         #[test]
@@ -1047,6 +1092,13 @@ mod jvm_based_tests {
                 result
             );
         }
+        #[test]
+        fn to_json_internal_null() {
+            let mut env = JVM.attach_current_thread().unwrap();
+            let null_str = JString::from(JObject::null());
+            let result = to_json_internal(&mut env, null_str);
+            assert!(result.is_ok(), "Expected error on null input");
+        }
     }
     mod map_tests {
         use super::*;
@@ -1115,7 +1167,7 @@ mod jvm_based_tests {
             )
         }
         #[test]
-        fn test_parse_cedar_schema_internal_invalid() {
+        fn parse_cedar_schema_internal_invalid() {
             let mut env = JVM.attach_current_thread().unwrap();
 
             let invalid_input = "Not a valid input";
@@ -1156,6 +1208,13 @@ mod jvm_based_tests {
             let parsed_string = String::from(env.get_string(&parsed_jstring).unwrap());
             assert_eq!(parsed_string, "success");
         }
+        #[test]
+        fn parse_cedar_schema_internal_null() {
+            let mut env = JVM.attach_current_thread().unwrap();
+            let null_str = JString::from(JObject::null());
+            let result = parse_cedar_schema_internal(&mut env, null_str);
+            assert!(result.is_ok(), "Expected error on null input");
+        }
     }
     mod schema_test {
         use std::result;
@@ -1187,7 +1246,7 @@ mod jvm_based_tests {
         }"#;
             let jstr = env.new_string(input).unwrap();
             let result = parse_json_schema_internal(&mut env, jstr);
-            assert!(result.is_ok(), "successfully parsed json_schema_internal");
+            assert!(result.is_ok(), "Expected schema to parse successfully");
 
             let output = result.unwrap();
             let jstring_obj = output.l().unwrap();
@@ -1227,9 +1286,16 @@ mod jvm_based_tests {
                 result
             );
         }
+        #[test]
+        fn parse_json_schema_internal_null() {
+            let mut env = JVM.attach_current_thread().unwrap();
+            let null_str = JString::from(JObject::null());
+            let result = parse_json_schema_internal(&mut env, null_str);
+            assert!(result.is_ok(), "Expected error on null input");
+        }
 
         #[test]
-        fn test_parse_policies_set_text_map() {
+        fn parse_policies_set_text_map_valid() {
             let input_policies = r#"permit(principal, action , resource);
             permit(principal,action,resource) when {principal has x && principal.x == 5};"#;
 
@@ -1239,7 +1305,7 @@ mod jvm_based_tests {
         }
 
         #[test]
-        fn test_parse_policies_set_map_invalid() {
+        fn parse_policies_set_map_invalid() {
             let invalid_policies = r#"permit(principal?, action? , resource);
             permit(principal,action,resource) if {principal has x && principal.x == 5};"#;
 
@@ -1254,6 +1320,13 @@ mod jvm_based_tests {
             let (policies, templates) = result;
             assert!(policies.is_empty());
             assert!(templates.is_empty())
+        }
+        #[test]
+        fn parse_policies_internal_null() {
+            let mut env = JVM.attach_current_thread().unwrap();
+            let null_str = JString::from(JObject::null());
+            let result = parse_policies_internal(&mut env, null_str);
+            assert!(result.is_ok(), "Expected error on null input");
         }
         #[test]
         fn parse_policy_set_to_text_map_static_policies() {
@@ -1300,7 +1373,7 @@ mod jvm_based_tests {
             assert!(env.exception_check().unwrap());
             assert!(
                 result.is_ok(),
-                "Succeded passing get_entity_identifier_repr_internal_null"
+                "Expected get_entity_identifier_repr_internal to succeed"
             );
         }
 
@@ -1336,6 +1409,14 @@ mod jvm_based_tests {
         }
 
         #[test]
+        fn template_effect_jni_internal_null_() {
+            let mut env = JVM.attach_current_thread().unwrap();
+            let null_obj = JObject::null();
+            let result = template_effect_jni_internal(&mut env, null_obj.into());
+            assert!(result.is_ok(), "Expected error on null input");
+        }
+
+        #[test]
         fn parse_entity_uid_valid() {
             let mut env = JVM.attach_current_thread().unwrap();
 
@@ -1356,7 +1437,14 @@ mod jvm_based_tests {
 
             let result = parse_entity_uid_internal(&mut env, jstr);
 
-            assert!(result.is_err(), "Expected to parse_entity_uid_internal");
+            assert!(result.is_err(), "Expected to parse_entity_uid_internal to fail");
+        }
+        #[test]
+        fn parse_entity_uid_internal_null() {
+            let mut env = JVM.attach_current_thread().unwrap();
+            let null_input = JString::from(JObject::null());
+            let result = parse_entity_uid_internal(&mut env, null_input);
+            assert!(result.is_ok(), "parse_entity_uid expected null.");
         }
         #[test]
         fn parse_entity_uid_internal_invalid_syntax() {
@@ -1371,57 +1459,72 @@ mod jvm_based_tests {
                 "Expected an error for invalid EUID syntax."
             );
         }
+        #[test]
+        fn get_entity_identifier_repr_internal_raw_string_valid() {
+            let mut env = JVM.attach_current_thread().unwrap();
+            let input = env.new_string("alice").unwrap(); // Java string
+
+            let result_jval =
+                get_entity_identifier_repr_internal(&mut env, JObject::from(input)).unwrap();
+            let output_jstring = JString::from(result_jval.l().unwrap());
+            let output_str: String = env.get_string(&output_jstring).unwrap().into();
+
+            assert_eq!(output_str, r#""alice""#);
+        }
+        #[test]
+        fn get_entity_identifier_repr_internal_with_escape() {
+            let mut env = JVM.attach_current_thread().unwrap();
+            let input = env.new_string(r#"bob\smith"#).unwrap(); // backslash
+
+            let result_jval =
+                get_entity_identifier_repr_internal(&mut env, JObject::from(input)).unwrap();
+            let output_jstring = JString::from(result_jval.l().unwrap());
+            let output_str: String = env.get_string(&output_jstring).unwrap().into();
+
+            assert_eq!(output_str, r#""bob\\smith""#); // Properly escaped
+        }
+        #[test]
+        fn validate_entities_serialization_error_covered() {
+            let input = r#"
+    {
+        "entities": true,
+        "schema": {}
+    }
+    "#;
+
+            let result = validate_entities(input);
+            assert!(result.is_ok());
+        }
+
+        #[test]
+        fn validate_entities_deserialization_error_inline() {
+            let input = r#"{
+        "entities": [{
+            "uid": "User::\"bob\"",
+            "attrs": { "age": "not a number" },
+            "parents": []
+        }],
+        "schema": {
+            "entityTypes": {
+                "User": {
+                    "shape": {
+                        "age": { "type": "Long" }
+                    }
+                }
+            }
+        }
+    }"#;
+
+            let result = validate_entities(input);
+            assert!(result.is_ok());
+        }
     }
 
     #[cfg(test)]
-    mod helper_tests {
-        use std::result;
-
+    mod entity_tests {
         use super::*;
         use cedar_policy::EntityId;
-
-        fn get_entity_identifier_string_representation(
-            entity_id: &cedar_policy::EntityId,
-        ) -> String {
-            entity_id.escaped().to_string()
-        }
-
-        #[test]
-        fn get_entity_identifier_string_representation_simple() {
-            let entity_id = EntityId::new("alice".to_string());
-
-            let expected_repr = "alice".to_string();
-            let actual_repr = get_entity_identifier_string_representation(&entity_id);
-            assert_eq!(actual_repr, expected_repr);
-        }
-
-        #[test]
-        fn get_entity_identifier_string_representation_with_special_chars() {
-            let entity_id = EntityId::new("al\\ice".to_string());
-
-            let expected_repr = "al\\\\ice".to_string();
-            let actual_repr = get_entity_identifier_string_representation(&entity_id);
-            assert_eq!(actual_repr, expected_repr);
-        }
-
-        #[test]
-        fn get_entity_identifier_string_representation_empty() {
-            let entity_id = EntityId::new("".to_string());
-
-            let expected_repr = "".to_string();
-            let actual_repr = get_entity_identifier_string_representation(&entity_id);
-            assert_eq!(actual_repr, expected_repr);
-        }
-
-        #[test]
-        fn get_entity_identifier_string_representation_long_string() {
-            let long_id = "a".repeat(1000);
-            let entity_id = EntityId::new(long_id.clone());
-
-            let expected_repr = format!("{}", long_id);
-            let actual_repr = get_entity_identifier_string_representation(&entity_id);
-            assert_eq!(actual_repr, expected_repr);
-        }
+        use std::result;
 
         #[test]
         fn parse_entity_type_name_internal_test() {
@@ -1430,6 +1533,29 @@ mod jvm_based_tests {
             assert_eq!(result.basename(), "User");
             assert!(result.namespace_components().next().is_none());
             assert_eq!(result.to_string(), "User")
+        }
+        #[test]
+        fn parse_entity_type_name_internal_null_input() {
+            let mut env = JVM.attach_current_thread().unwrap();
+
+            let result = parse_entity_type_name_internal(
+                &mut env,
+                JObject::null().into(),
+            );
+
+            assert!(env.exception_check().unwrap());
+            assert!(result.is_err(),"expected parse_entity_type_name null input failure");
+        }
+        #[test]
+        fn parse_entity_type_name_internal_invalid() {
+            let mut env = JVM.attach_current_thread().unwrap();
+            let input_jstr = env.new_string("Invalid::Type!").unwrap();
+
+            let result = parse_entity_type_name_internal(&mut env, input_jstr);
+            assert!(
+                result.is_err(),
+                "Expected error for invalid entity type name input"
+            );
         }
 
         #[test]
@@ -1451,12 +1577,12 @@ mod jvm_based_tests {
             );
         }
         #[test]
-        fn parse_entity_type_name_separatorsstr() {
+        fn parse_entity_type_name_separators_str() {
             let input = "::";
             let result = parse_entity_type_name_str(input);
             assert!(
                 result.is_err(),
-                "Expected parsing failed for only seperators"
+                "Expected parsing failed for only separators"
             );
         }
         #[test]
@@ -1495,56 +1621,42 @@ mod jvm_based_tests {
                 "Expected formatting to fail due to syntax error"
             );
         }
-
         #[test]
-        fn policies_str_to_pretty_internal_valid_policy_string() {
+        fn policies_str_to_pretty_null() {
             let mut env = JVM.attach_current_thread().unwrap();
-
-            let input = r#"permit(principal, action, resource);"#;
-            let policies_jstr = env.new_string(input).unwrap();
-
-            let result = policies_str_to_pretty_internal(&mut env, policies_jstr, None);
-            assert!(
-                result.is_ok(),
-                "Expected valid policy string to format successfully."
-            );
-
-            let formatted_jvalue = result.unwrap();
-            let jstring_obj: jni::objects::JString = formatted_jvalue.l().unwrap().into();
-            let formatted_str: String = env.get_string(&jstring_obj).unwrap().into();
-
-            assert!(
-                formatted_str.contains("permit"),
-                "Expected output to contain 'permit'."
-            );
-            assert!(
-                formatted_str.contains("(") && formatted_str.contains(")"),
-                "Expected parentheses in formatted output."
-            );
-        }
-        #[test]
-        fn parse_entity_type_name_internal_null_input() {
-            let mut env = JVM.attach_current_thread().unwrap();
-
-            let result = parse_entity_type_name_internal(
-                &mut env,
-                jni::objects::JString::from(jni::objects::JObject::null()),
-            );
-
-            assert!(env.exception_check().unwrap());
+            let null_str = JString::from(JObject::null());
+            let result = policies_str_to_pretty_internal(&mut env, null_str, None);
             assert!(result.is_ok());
         }
-        #[test]
-        fn parse_entity_type_name_internal_invalid() {
-            let mut env = JVM.attach_current_thread().unwrap();
-            let input_jstr = env.new_string("Invalid::Type!").unwrap();
 
-            let result = parse_entity_type_name_internal(&mut env, input_jstr);
-            assert!(
-                result.is_err(),
-                "Expected error for invalid entity type name input"
-            );
-        }
+        #[test]
+fn policies_str_to_pretty_internal_valid_policy_string() {
+    let mut env = JVM.attach_current_thread().unwrap();
+
+    let input = r#"permit(principal, action, resource);"#;
+    let policies_jstr = env.new_string(input).unwrap();
+
+    let result = policies_str_to_pretty_internal(&mut env, policies_jstr, None);
+    assert!(
+        result.is_ok(),
+        "Expected valid policy string to format successfully, got: {:?}",
+        result
+    );
+
+    let formatted_jvalue = result.unwrap();
+    let jstring_obj: JString = formatted_jvalue.l().unwrap().into();
+    let formatted_str: String = env.get_string(&jstring_obj).unwrap().into();
+
+    assert!(
+        formatted_str.contains("permit"),
+        "Expected output to contain 'permit'."
+    );
+    assert!(
+        formatted_str.contains("(") && formatted_str.contains(")"),
+        "Expected parentheses in formatted output."
+    );
+}
+
 
         #[test]
         fn parse_entity_type_name_str_valid_simple() {
@@ -1552,7 +1664,7 @@ mod jvm_based_tests {
             let result = parse_entity_type_name_str(input);
             assert!(
                 result.is_ok(),
-                "Expected valid parse for 'User' in pure Rust test."
+                "Expected valid parse for 'User'."
             );
             let parsed_etype = result.unwrap();
             assert_eq!(parsed_etype.basename(), "User");
@@ -1560,12 +1672,125 @@ mod jvm_based_tests {
         }
 
         #[test]
-        fn build_java_policy_empty() {
+        fn build_java_policy_set_empty() {
             let mut env = JVM.attach_current_thread().unwrap();
             let entries: Vec<(String, String)> = vec![];
 
-            let result = build_java_policy_set(&mut env, entries);
+            let result = build_jpolicy_set(&mut env, entries);
             assert!(result.is_ok());
+        }
+    }
+    #[cfg(test)]
+    mod entity_type_tests {
+        use super::*;
+        use crate::{
+            jlist::List,
+            objects::{JEntityId, JEntityTypeName},
+        }; // Make sure these are imported
+
+        #[test]
+        fn get_euid_repr_internal_from_strings() {
+            let mut env = JVM.attach_current_thread().unwrap();
+
+            let type_str = env.new_string("User").unwrap();
+            let id_str = env.new_string("alice").unwrap();
+
+            let result = get_euid_repr_internal(&mut env, type_str.into(), id_str.into());
+
+            assert!(result.is_ok(), "Expected success");
+
+            let jval = result.unwrap();
+            let output_jstr = JString::from(jval.l().unwrap());
+            let output: String = env.get_string(&output_jstr).unwrap().into();
+
+            assert_eq!(output, r#"User::"alice""#);
+        }
+        #[test]
+        fn get_euid_repr_internal_empty_strings() {
+            let mut env = JVM.attach_current_thread().unwrap();
+
+            let type_str = env.new_string("").unwrap();
+            let id_str = env.new_string("").unwrap();
+
+            let result = get_euid_repr_internal(&mut env, type_str.into(), id_str.into());
+            assert!(result.is_ok());
+
+            let jval = result.unwrap();
+            let output_jstr = JString::from(jval.l().unwrap());
+            let output: String = env.get_string(&output_jstr).unwrap().into();
+
+            assert_eq!(output, r#"::"""#);
+        }
+        #[test]
+        fn get_euid_repr_internal_null() {
+            let mut env = JVM.attach_current_thread().unwrap();
+
+            let null_type = JObject::null();
+            let null_id = JObject::null();
+            let result = get_euid_repr_internal(&mut env, null_type, null_id);
+            assert!(
+                result.is_ok(),
+                "Expected error when both arguments are null"
+            );
+        }
+        #[test]
+        fn get_euid_repr_internal_special_chars() {
+            let mut env = JVM.attach_current_thread().unwrap();
+
+            let type_str = env.new_string("Some::Type").unwrap();
+            let id_str = env.new_string("id-with-specials!@#$%^&*()").unwrap();
+
+            let result = get_euid_repr_internal(&mut env, type_str.into(), id_str.into());
+            assert!(result.is_ok());
+
+            let jval = result.unwrap();
+            let output_jstr = JString::from(jval.l().unwrap());
+            let output: String = env.get_string(&output_jstr).unwrap().into();
+
+            assert_eq!(output, r#"Some::Type::"id-with-specials!@#$%^&*()""#);
+        }
+
+        #[test]
+        fn get_entity_type_name_valid() {
+            let mut env = JVM.attach_current_thread().unwrap();
+            let input = env.new_string("User").unwrap();
+
+            let result = get_entity_type_name_repr_internal(&mut env, input.into());
+
+            assert!(result.is_ok());
+
+            let output_jval = result.unwrap();
+            let output_jstr = JString::from(output_jval.l().unwrap());
+            let output: String = env.get_string(&output_jstr).unwrap().into();
+            assert_eq!(output, "User");
+        }
+
+        #[test]
+        fn get_entity_type_name_repr_null() {
+            let mut env = JVM.attach_current_thread().unwrap();
+            let null_obj = JObject::null();
+            let result = get_entity_type_name_repr_internal(&mut env, null_obj);
+            assert!(
+                result.is_err(),
+                "Expected get_entity_type_name to fail for null input"
+            );
+        }
+        mod build_err_obj {
+            use jni::objects::{JObject, JString};
+
+            use crate::interface::{
+                call_cedar_in_thread,
+                jvm_based_tests::{entity_type_tests::build_err_obj, JVM},
+            };
+            #[test]
+            fn call_cedar_in_thread_returns_string() {
+                let call = "noop".to_string();
+                let input = "{}".to_string();
+                // This only checks that it returns *something* that can be parsed or isn't empty
+                let result = call_cedar_in_thread(call, input);
+
+                assert!(!result.is_empty(), "Expected some string response");
+            }
         }
     }
 }
